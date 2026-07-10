@@ -6044,7 +6044,7 @@ class MemoryEngine(MemoryEngineInterface):
            ``world`` fact:
              a. ``enqueue_relink_victims`` BEFORE the cascade — once the rows
                 are gone the join finding them returns nothing.
-             b. Chunked ``DELETE FROM memory_units WHERE id = ANY(...)``.
+             b. Chunked cascade DELETE against ``fq_table('memory_units')``.
                 Cascade handles ``unit_entities``, ``memory_links``, and the
                 observation history tables (see the baseline FK CASCADE
                 constraints in ``o1a2b3c4d5e6_oracle_baseline``).
@@ -6114,8 +6114,7 @@ class MemoryEngine(MemoryEngineInterface):
                 # been deleted between the caller's discovery query and this
                 # call; a missing id is not an error).
                 rows = await conn.fetch(
-                    f"SELECT id, bank_id, fact_type FROM {fq_table('memory_units')} "
-                    f"WHERE id = ANY($1::uuid[])",
+                    f"SELECT id, bank_id, fact_type FROM {fq_table('memory_units')} WHERE id = ANY($1::uuid[])",
                     validated_ids,
                 )
 
@@ -6136,9 +6135,7 @@ class MemoryEngine(MemoryEngineInterface):
                     if source_ids:
                         from .graph_maintenance import enqueue_relink_victims
 
-                        await enqueue_relink_victims(
-                            conn, bank_id, source_ids, ops=backend.ops
-                        )
+                        await enqueue_relink_victims(conn, bank_id, source_ids, ops=backend.ops)
 
                     # 3b. Chunked delete. Cascade handles unit_entities /
                     # memory_links / observation history via FK.
@@ -6146,8 +6143,7 @@ class MemoryEngine(MemoryEngineInterface):
                     for i in range(0, len(ids_for_bank), CHUNK_SIZE):
                         chunk = ids_for_bank[i : i + CHUNK_SIZE]
                         tag = await conn.execute(
-                            f"DELETE FROM {fq_table('memory_units')} "
-                            f"WHERE id = ANY($1::uuid[])",
+                            f"DELETE FROM {fq_table('memory_units')} WHERE id = ANY($1::uuid[])",
                             chunk,
                         )
                         # asyncpg tag: "DELETE N"
@@ -6163,11 +6159,7 @@ class MemoryEngine(MemoryEngineInterface):
                     # source_memory_ids).
                     invalidated = 0
                     if source_ids:
-                        invalidated = (
-                            await self._delete_stale_observations_for_memories(
-                                conn, bank_id, source_ids
-                            )
-                        )
+                        invalidated = await self._delete_stale_observations_for_memories(conn, bank_id, source_ids)
                         if invalidated > 0:
                             banks_with_invalidated_obs.add(bank_id)
 
@@ -6189,35 +6181,22 @@ class MemoryEngine(MemoryEngineInterface):
                 await self._bank_stats_cache.invalidate(current_schema, bank_id)
             except Exception as e:
                 logger.warning(
-                    f"Failed to invalidate bank stats cache after bulk memory "
-                    f"deletion for bank {bank_id}: {e}"
+                    f"Failed to invalidate bank stats cache after bulk memory deletion for bank {bank_id}: {e}"
                 )
 
         for bank_id in banks_with_invalidated_obs:
             try:
-                config = await self._config_resolver.resolve_full_config(
-                    bank_id, request_context
-                )
+                config = await self._config_resolver.resolve_full_config(bank_id, request_context)
                 if config.enable_auto_consolidation:
-                    await self.submit_async_consolidation(
-                        bank_id=bank_id, request_context=request_context
-                    )
+                    await self.submit_async_consolidation(bank_id=bank_id, request_context=request_context)
             except Exception as e:
-                logger.warning(
-                    f"Failed to submit consolidation after bulk memory "
-                    f"deletion for bank {bank_id}: {e}"
-                )
+                logger.warning(f"Failed to submit consolidation after bulk memory deletion for bank {bank_id}: {e}")
 
         for bank_id in banks_with_source_deletes:
             try:
-                await self.submit_async_graph_maintenance(
-                    bank_id=bank_id, request_context=request_context
-                )
+                await self.submit_async_graph_maintenance(bank_id=bank_id, request_context=request_context)
             except Exception as e:
-                logger.warning(
-                    f"Failed to submit graph maintenance after bulk memory "
-                    f"deletion for bank {bank_id}: {e}"
-                )
+                logger.warning(f"Failed to submit graph maintenance after bulk memory deletion for bank {bank_id}: {e}")
 
         return {
             "requested": len(unit_ids),

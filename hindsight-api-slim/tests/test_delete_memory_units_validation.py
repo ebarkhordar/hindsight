@@ -6,6 +6,7 @@ Postgres (``test_bank_stats_cache_invalidation.py``, ``test_graph_maintenance.py
 These tests cover the pure-Python guard rails so a bad input surfaces the
 right error without ever reaching a connection.
 """
+
 from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock
@@ -38,7 +39,8 @@ async def test_empty_unit_ids_returns_zero_without_auth():
     engine = _stub_engine()
 
     result = await engine.delete_memory_units(
-        [], request_context=RequestContext(api_key="anything"),
+        [],
+        request_context=RequestContext(api_key="anything"),
     )
 
     assert result == {"requested": 0, "deleted": 0, "per_bank": {}}
@@ -55,7 +57,8 @@ async def test_invalid_uuid_raises_value_error_before_auth():
 
     with pytest.raises(ValueError, match="Invalid unit_id"):
         await engine.delete_memory_units(
-            ["not-a-uuid"], request_context=RequestContext(api_key="k"),
+            ["not-a-uuid"],
+            request_context=RequestContext(api_key="k"),
         )
 
     engine._authenticate_tenant.assert_not_awaited()

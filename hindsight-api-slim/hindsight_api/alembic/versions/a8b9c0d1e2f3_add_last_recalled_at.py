@@ -1,14 +1,23 @@
-"""Track last-recalled recency on memory_units and documents.
+"""Track last-recalled recency on memory_units, documents, and the archive.
 
-Adds a nullable ``last_recalled_at TIMESTAMPTZ`` column to ``memory_units`` and
-``documents``, plus a partial btree index on each that only carries rows where
-the column is not null. Consumers can stamp the column from any recall path
-(e.g. via ``OperationValidatorExtension.on_recall_complete``) to power generic
+Adds a nullable ``last_recalled_at TIMESTAMPTZ`` column to ``memory_units``,
+``documents``, and ``invalidated_memory_units``, plus a partial btree index on
+``memory_units`` and ``documents`` (the archive is cold storage and gets no
+index). Consumers can stamp the column from any recall path (e.g. via
+``OperationValidatorExtension.on_recall_complete``) to power generic
 lifecycle use cases: LRU / eviction ordering, analytics on the dormant-memory
 tail, cache warmup, and time-based cleanup policies. Downstream retention
 readers should ``COALESCE(last_recalled_at, created_at)`` when they want a
 "never-recalled-since-ingest" fallback, so a document ingested but not yet
 recalled falls back to its ingestion time.
+
+The column also lands on ``invalidated_memory_units`` because curation moves
+rows between ``memory_units`` and the archive via ``INSERT ... SELECT`` over
+the full memory_units column list (see ``curate_memory`` in
+``memory_engine.py`` — ``_archive_omitted`` only excludes ``embedding`` and
+``search_vector``). Without the archive-side column, an
+invalidate-then-revert round-trip would fail on the INSERT with a missing-
+column error. Archive gets no index because it isn't a recall surface.
 
 Column defaults to NULL; existing rows are unaffected. The partial index keeps
 lookups cheap on tenants where most rows never get stamped — a full btree over
@@ -20,7 +29,7 @@ PG-only migration: the recall path this signal is meant for is PG-only today
 Oracle without a writer to stamp them would just be dead schema.
 
 Revision ID: a8b9c0d1e2f3
-Revises: f4d1c2b3a5e6
+Revises: e7c3a9f1b2d5
 Create Date: 2026-07-10
 """
 
@@ -31,7 +40,7 @@ from alembic import context, op
 from hindsight_api.alembic._dialect import run_for_dialect
 
 revision: str = "a8b9c0d1e2f3"
-down_revision: str | Sequence[str] | None = "f4d1c2b3a5e6"
+down_revision: str | Sequence[str] | None = "e7c3a9f1b2d5"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
@@ -54,6 +63,15 @@ def _pg_upgrade() -> None:
     op.execute(
         f"""
         ALTER TABLE {schema}documents
+        ADD COLUMN IF NOT EXISTS last_recalled_at TIMESTAMPTZ DEFAULT NULL
+        """
+    )
+    # Archive gets the column so ``curate_memory``'s
+    # ``INSERT ... SELECT`` round-trip keeps working. No index — the
+    # archive isn't a recall surface.
+    op.execute(
+        f"""
+        ALTER TABLE {schema}invalidated_memory_units
         ADD COLUMN IF NOT EXISTS last_recalled_at TIMESTAMPTZ DEFAULT NULL
         """
     )
@@ -84,6 +102,7 @@ def _pg_downgrade() -> None:
 
     op.execute(f"DROP INDEX IF EXISTS {schema}idx_documents_last_recalled_at")
     op.execute(f"DROP INDEX IF EXISTS {schema}idx_memory_units_last_recalled_at")
+    op.execute(f"ALTER TABLE {schema}invalidated_memory_units DROP COLUMN IF EXISTS last_recalled_at")
     op.execute(f"ALTER TABLE {schema}documents DROP COLUMN IF EXISTS last_recalled_at")
     op.execute(f"ALTER TABLE {schema}memory_units DROP COLUMN IF EXISTS last_recalled_at")
 
