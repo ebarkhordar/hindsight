@@ -44,7 +44,10 @@ def pre_backfill_db_url():
     migration's UPDATE runs against seeded NULL-search_vector observations."""
     from hindsight_api.pg0 import EmbeddedPostgres
 
-    pg0 = EmbeddedPostgres(name="hindsight-obs-sv-backfill-test", port=5568)
+    # Distinct port from ``test_migration_remaining_bank_id_text.py`` (5568): that
+    # module-scoped fixture's postgres subprocess outlives fixture teardown for
+    # the worker process, so a second file hardcoding 5568 collides under xdist.
+    pg0 = EmbeddedPostgres(name="hindsight-obs-sv-backfill-test", port=5569)
     loop = asyncio.new_event_loop()
     try:
         url = loop.run_until_complete(pg0.ensure_running())
