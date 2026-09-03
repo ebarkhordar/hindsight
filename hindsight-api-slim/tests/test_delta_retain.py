@@ -594,6 +594,153 @@ async def test_delta_retain_tags_propagated_to_existing_units(memory, request_co
         await memory.delete_bank(bank_id, request_context=request_context)
 
 
+_LABEL_TAG_CONTENT = "The team standardised on Postgres for the metadata store."
+
+
+def test_reconcile_unit_tags():
+    """The document-derived half is replaced; the rest of the unit's tags is kept."""
+    from hindsight_api.engine.retain.fact_storage import _reconcile_unit_tags
+
+    unit = ["team-a", "category:durable"]
+
+    # No previous tag set to compare against: nothing can be told apart, so the
+    # document's tags are applied as-is.
+    assert _reconcile_unit_tags(unit, ["team-b"], None) == ["team-b"]
+
+    # team-a came from the document and is gone from it; category:durable did not.
+    assert _reconcile_unit_tags(unit, ["team-b"], ["team-a"]) == ["team-b", "category:durable"]
+
+    # A document that carried no tags contributed none of the unit's.
+    assert _reconcile_unit_tags(unit, ["team-b"], []) == ["team-b", "team-a", "category:durable"]
+
+    # A kept tag that the document now also carries is not duplicated.
+    assert _reconcile_unit_tags(unit, ["category:durable"], []) == ["category:durable", "team-a"]
+
+    assert _reconcile_unit_tags([], ["team-b"], ["team-a"]) == ["team-b"]
+    assert _reconcile_unit_tags(unit, [], ["team-a"]) == ["category:durable"]
+
+
+async def _bank_with_label_tags(memory, request_context, bank_id):
+    """A bank whose `category` label group doubles as a tag, with a stub extractor."""
+    await memory._ensure_bank_exists(bank_id, request_context)
+    await memory._config_resolver.update_bank_config(
+        bank_id=bank_id,
+        updates={
+            "entity_labels": [
+                {
+                    "key": "category",
+                    "description": "Kind of decision",
+                    "type": "multi-values",
+                    "tag": True,
+                    "optional": True,
+                    "values": [{"value": "durable", "description": "A durable technical decision"}],
+                }
+            ],
+            "entities_allow_free_form": False,
+        },
+        context=request_context,
+    )
+
+    def _one_labelled_fact(messages, scope):
+        if scope != "retain_extract_facts":
+            return None
+        return {
+            "facts": [
+                {
+                    "what": _LABEL_TAG_CONTENT,
+                    "when": "N/A",
+                    "where": "N/A",
+                    "who": "N/A",
+                    "why": "N/A",
+                    "fact_kind": "conversation",
+                    "fact_type": "world",
+                    "entities": [],
+                    "labels": {"category": ["durable"]},
+                }
+            ]
+        }
+
+    memory._retain_llm_config.set_response_callback(_one_labelled_fact)
+
+
+async def _unit_tags(memory, request_context, bank_id, document_id):
+    listing = await memory.list_memory_units(
+        bank_id, document_id=document_id, limit=1000, request_context=request_context
+    )
+    return [sorted(row["tags"] or []) for row in listing["items"]]
+
+
+@pytest.mark.asyncio
+async def test_delta_retain_keeps_label_derived_tags_on_surviving_units(memory, request_context):
+    """
+    A tag `_inject_label_tags` derived for one fact lives only on that memory unit,
+    never on the document row, so the document's tag set cannot reproduce it. A
+    re-retain of unchanged content takes the metadata-only path, which must
+    reconcile the document-derived tags rather than replace the unit's whole list.
+    """
+    bank_id = f"test_delta_label_tags_{_ts()}"
+    document_id = "label-tags-doc"
+
+    try:
+        await _bank_with_label_tags(memory, request_context, bank_id)
+
+        await memory.retain_batch_async(
+            bank_id=bank_id,
+            contents=[{"content": _LABEL_TAG_CONTENT, "document_id": document_id, "tags": ["scope:test"]}],
+            request_context=request_context,
+        )
+        v1 = await _unit_tags(memory, request_context, bank_id, document_id)
+        assert v1 == [["category:durable", "scope:test"]], f"extraction should tag the unit, got {v1}"
+
+        # Byte-identical content, one document tag added: no chunk changes, so this
+        # is the metadata-only delta path.
+        await memory.retain_batch_async(
+            bank_id=bank_id,
+            contents=[{"content": _LABEL_TAG_CONTENT, "document_id": document_id, "tags": ["scope:test", "team-b"]}],
+            request_context=request_context,
+        )
+
+        v2 = await _unit_tags(memory, request_context, bank_id, document_id)
+        assert v2 == [["category:durable", "scope:test", "team-b"]], (
+            f"the label-derived tag should survive and the new document tag should propagate, got {v2}"
+        )
+    finally:
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+
+@pytest.mark.asyncio
+async def test_delta_retain_drops_a_removed_document_tag_from_surviving_units(memory, request_context):
+    """
+    Reconciling must not turn into "keep everything": a tag the document no longer
+    carries is still removed from its units, which is what the observation
+    invalidation cascade keys on.
+    """
+    bank_id = f"test_delta_tag_removal_{_ts()}"
+    document_id = "tag-removal-doc"
+
+    try:
+        await _bank_with_label_tags(memory, request_context, bank_id)
+
+        await memory.retain_batch_async(
+            bank_id=bank_id,
+            contents=[{"content": _LABEL_TAG_CONTENT, "document_id": document_id, "tags": ["scope:test", "team-a"]}],
+            request_context=request_context,
+        )
+        v1 = await _unit_tags(memory, request_context, bank_id, document_id)
+        assert v1 == [["category:durable", "scope:test", "team-a"]], f"unexpected v1 tags: {v1}"
+
+        await memory.retain_batch_async(
+            bank_id=bank_id,
+            contents=[{"content": _LABEL_TAG_CONTENT, "document_id": document_id, "tags": ["scope:test"]}],
+            request_context=request_context,
+        )
+
+        v2 = await _unit_tags(memory, request_context, bank_id, document_id)
+        assert v2 == [["category:durable", "scope:test"]], f"team-a should be gone, got {v2}"
+    finally:
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+
 # ============================================================
 # Chunk Management Tests
 # ============================================================

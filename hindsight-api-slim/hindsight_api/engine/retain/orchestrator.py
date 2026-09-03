@@ -3819,11 +3819,16 @@ async def _try_delta_retain(
         # the chunk state we based our delta diff on is stale — abort.
         async with acquire_with_retry(pool) as conn:
             async with conn.transaction():
-                current_hash = await conn.fetchval(
-                    f"SELECT content_hash FROM {fq_table('documents')} WHERE id = $1 AND bank_id = $2 FOR UPDATE",
+                # Read the tags in the same locked row: once the document row is
+                # rewritten below, which half of a survivor's tags came from the
+                # document is no longer answerable.
+                prior_doc = await conn.fetchrow(
+                    f"SELECT content_hash, tags FROM {fq_table('documents')} WHERE id = $1 AND bank_id = $2 FOR UPDATE",
                     effective_doc_id,
                     bank_id,
                 )
+                current_hash = prior_doc["content_hash"] if prior_doc else None
+                previous_document_tags = list(prior_doc["tags"] or []) if prior_doc else None
                 # Verify the document hasn't been replaced since we loaded chunks.
                 # Compare the current hash against what we snapshotted at load time.
                 if current_hash is not None and doc_hash_at_load is not None and current_hash != doc_hash_at_load:
@@ -3897,6 +3902,7 @@ async def _try_delta_retain(
                     merged_tags,
                     retain_params.get("metadata", {}),
                     observation_scopes=retain_params.get("observation_scopes"),
+                    previous_document_tags=previous_document_tags,
                     ops=pool.ops,
                 )
                 log_buffer.append(
@@ -4024,6 +4030,12 @@ async def _delta_metadata_only(
         # facts alone" — would otherwise decide it HAD moved and fall back to a full retain, which
         # rebuilds the facts and orphans every observation standing on them.
         current_content_hash = await _meta_store.document_content_hash(bank_id=bank_id, document_id=document_id)
+        # `put_document` below replaces the record's tags, so read the ones it is
+        # about to replace. A store that does not report them leaves this None and
+        # the units are relabelled with the document's tags alone, as before.
+        _prior_record = await _meta_store.get_document_record(bank_id=bank_id, document_id=document_id)
+        _prior_tags = (_prior_record or {}).get("tags")
+        previous_document_tags = list(_prior_tags) if _prior_tags is not None else None
         if expected_content_hash is not None and current_content_hash != expected_content_hash:
             log_buffer.append(
                 f"[delta] Document {document_id} changed before metadata update — falling back to full retain"
@@ -4065,6 +4077,7 @@ async def _delta_metadata_only(
                     merged_tags,
                     retain_params.get("metadata", {}),
                     observation_scopes=retain_params.get("observation_scopes"),
+                    previous_document_tags=previous_document_tags,
                     ops=pool.ops,
                 )
         if outbox_callback is not None:
@@ -4079,11 +4092,16 @@ async def _delta_metadata_only(
     async with acquire_with_retry(pool) as conn:
         async with conn.transaction():
             # Lock the document row to serialize with concurrent retains
-            current_content_hash = await conn.fetchval(
-                f"SELECT content_hash FROM {fq_table('documents')} WHERE id = $1 AND bank_id = $2 FOR UPDATE",
+            # Tags come from the same locked read: `upsert_document_metadata` below
+            # overwrites them, and after that which half of a survivor's tags the
+            # document contributed is no longer answerable.
+            prior_doc = await conn.fetchrow(
+                f"SELECT content_hash, tags FROM {fq_table('documents')} WHERE id = $1 AND bank_id = $2 FOR UPDATE",
                 document_id,
                 bank_id,
             )
+            current_content_hash = prior_doc["content_hash"] if prior_doc else None
+            previous_document_tags = list(prior_doc["tags"] or []) if prior_doc else None
             if expected_content_hash is not None and current_content_hash != expected_content_hash:
                 log_buffer.append(
                     f"[delta] Document {document_id} changed before metadata update — falling back to full retain"
@@ -4112,6 +4130,7 @@ async def _delta_metadata_only(
                 merged_tags,
                 retain_params.get("metadata", {}),
                 observation_scopes=retain_params.get("observation_scopes"),
+                previous_document_tags=previous_document_tags,
                 ops=pool.ops,
             )
             if outbox_callback is not None:

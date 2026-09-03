@@ -417,6 +417,31 @@ def _normalize_scopes(value: list | str | None) -> list | str | None:
     return value
 
 
+def _reconcile_unit_tags(
+    unit_tags: list[str] | None,
+    document_tags: list[str] | None,
+    previous_document_tags: list[str] | None,
+) -> list[str]:
+    """The tags a surviving unit should carry after a delta retain.
+
+    A unit's tags are the document's tags plus whatever extraction derived for that
+    fact alone (``_inject_label_tags`` appends a ``key:value`` tag per entity label
+    group configured with ``tag: true``). Only the first half is reproducible from
+    the document row, so replacing the list wholesale drops the second half.
+
+    ``previous_document_tags`` is the document's tag set before this retain, which is
+    what makes the two halves separable: anything the unit carries that the old
+    document tag set did not put there is fact-derived and is kept. ``None`` means the
+    caller could not read it, and the document's tags are applied as-is.
+    """
+    incoming = list(document_tags or [])
+    if previous_document_tags is None:
+        return incoming
+    previous = set(previous_document_tags)
+    already = set(incoming)
+    return incoming + [t for t in (unit_tags or []) if t not in previous and t not in already]
+
+
 async def update_memory_units_metadata_and_tags(
     conn,
     bank_id: str,
@@ -425,6 +450,7 @@ async def update_memory_units_metadata_and_tags(
     metadata: dict[str, Any],
     *,
     observation_scopes: list | str | None = None,
+    previous_document_tags: list[str] | None = None,
     ops=None,
 ) -> int:
     """Update document-level attributes on existing memory units.
@@ -432,6 +458,13 @@ async def update_memory_units_metadata_and_tags(
     Delta retain preserves unchanged chunks and their facts. Propagate the
     current document tags, metadata and observation scoping so its optimized
     result matches a full replace.
+
+    Matching a full replace is why ``previous_document_tags`` exists: a full
+    replace re-extracts, so it re-derives the per-fact label tags this path has
+    no way to recompute. Given the document's previous tag set, those tags are
+    the ones a survivor carries that the previous set did not contain, and they
+    are kept (see ``_reconcile_unit_tags``). Without it the units are relabelled
+    with the document's tags alone.
 
     ``metadata`` arrives as the raw retain_params bag (the document row keeps
     the caller's input verbatim), so null-valued keys are dropped here — the
@@ -480,10 +513,11 @@ async def update_memory_units_metadata_and_tags(
         #
         # Set unconditionally, mirroring `SET metadata = $4`: a document whose metadata was cleared
         # must clear on its survivors too, which an absent key would not do.
+        reconciled = {m.unit_id: _reconcile_unit_tags(m.tags, tags, previous_document_tags) for m in page.memories}
         patches = [
             MemoryPatch(
                 unit_id=m.unit_id,
-                tags=list(tags or []),
+                tags=reconciled[m.unit_id],
                 metadata={
                     META_METADATA_JSON: json.dumps(drop_null_values(metadata or {})),
                     META_OBSERVATION_SCOPES: json.dumps(observation_scopes),
@@ -498,7 +532,7 @@ async def update_memory_units_metadata_and_tags(
             for m in page.memories
             if m.fact_type in ("experience", "world")
             and (
-                set(m.tags or []) != set(tags or [])
+                set(m.tags or []) != set(reconciled[m.unit_id])
                 or _normalize_scopes(m.observation_scopes) != _normalize_scopes(observation_scopes)
             )
         ]
@@ -520,15 +554,24 @@ async def update_memory_units_metadata_and_tags(
         bank_id,
         document_id,
     )
+    reconciled_by_id = {row["id"]: _reconcile_unit_tags(row["tags"], tags, previous_document_tags) for row in prior}
     rescoped_ids = [
         row["id"]
         for row in prior
         if row["fact_type"] in ("experience", "world")
         and (
-            set(row["tags"] or []) != set(tags or [])
+            set(row["tags"] or []) != set(reconciled_by_id[row["id"]])
             or _normalize_scopes(row["observation_scopes"]) != _normalize_scopes(observation_scopes)
         )
     ]
+    # Rows that keep something extra, grouped so the follow-up below is one statement per
+    # distinct tag list rather than one per unit. Empty whenever no unit carries a
+    # fact-derived tag, which is every document without label tags.
+    keepers: dict[tuple[str, ...], list] = {}
+    for row in prior:
+        reconciled = reconciled_by_id[row["id"]]
+        if set(reconciled) != set(tags or []):
+            keepers.setdefault(tuple(reconciled), []).append(row["id"])
 
     result = await conn.execute(
         f"""
@@ -542,6 +585,14 @@ async def update_memory_units_metadata_and_tags(
         json.dumps(drop_null_values(metadata)),
         json.dumps(observation_scopes) if observation_scopes is not None else None,
     )
+
+    for reconciled, unit_ids in keepers.items():
+        await conn.execute(
+            f"UPDATE {fq_table('memory_units')} SET tags = $1 WHERE bank_id = $2 AND id = ANY($3::uuid[])",
+            list(reconciled),
+            bank_id,
+            unit_ids,
+        )
 
     if rescoped_ids:
         await delete_stale_observations_for_memories(conn, bank_id, rescoped_ids, ops=ops)
