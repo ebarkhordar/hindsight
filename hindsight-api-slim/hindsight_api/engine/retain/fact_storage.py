@@ -433,6 +433,12 @@ def _reconcile_unit_tags(
     what makes the two halves separable: anything the unit carries that the old
     document tag set did not put there is fact-derived and is kept. ``None`` means the
     caller could not read it, and the document's tags are applied as-is.
+
+    The separation is a set difference, so it cannot split a tag the document
+    supplied *and* extraction derived: that tag reads as document-derived in full
+    and is dropped when the document drops it, where a full replace would re-run
+    ``_inject_label_tags`` and keep it. Telling those apart needs the unit's
+    entities and the bank's label config, neither of which this layer has.
     """
     incoming = list(document_tags or [])
     if previous_document_tags is None:

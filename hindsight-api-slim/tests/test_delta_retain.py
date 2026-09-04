@@ -619,6 +619,13 @@ def test_reconcile_unit_tags():
     assert _reconcile_unit_tags([], ["team-b"], ["team-a"]) == ["team-b"]
     assert _reconcile_unit_tags(unit, [], ["team-a"]) == ["category:durable"]
 
+    # The one case a set difference cannot separate, pinned so it is a known
+    # answer rather than a surprise: the document supplied `category:durable` and
+    # extraction also derived it for the fact. The tag reads as document-derived
+    # in full and goes when the document drops it, where a full replace would
+    # re-run `_inject_label_tags` and keep it.
+    assert _reconcile_unit_tags(["category:durable"], [], ["category:durable"]) == []
+
 
 async def _bank_with_label_tags(memory, request_context, bank_id):
     """A bank whose `category` label group doubles as a tag, with a stub extractor."""
