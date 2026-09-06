@@ -2459,6 +2459,53 @@ class TestBuildResponseModel:
         assert len(result.creates) == expected_creates
 
 
+class TestDeleteActionObservationId:
+    """A DELETE entry is keyed by `observation_id`, and the prompt has to say so.
+
+    `_OBSERVATION_FIELDS` describes the observation's own key as `id`, so a model
+    that follows it literally emits `{"id": ...}` for a delete. `ValidationError`
+    is FAIL_FAST in `_classify_batch_failure`, so one such entry loses the whole
+    batch with no retry and nothing deleted (#4152).
+    """
+
+    OBS_ID = "e5f6a7b8-c9d0-1234-efab-345678901234"
+
+    def test_prompt_names_observation_id_for_deletes(self):
+        from hindsight_api.engine.consolidation.prompts import build_consolidation_system_prompt
+
+        rules = [line for line in build_consolidation_system_prompt().splitlines() if line.startswith("- `deletes`:")]
+        assert len(rules) == 1
+        assert "observation_id" in rules[0]
+
+    def test_delete_accepts_the_key_the_observation_arrives_under(self):
+        from hindsight_api.engine.consolidation.consolidator import _ConsolidationBatchResponse
+
+        response = _ConsolidationBatchResponse.model_validate(
+            {"creates": [], "updates": [], "deletes": [{"id": self.OBS_ID, "reason": "superseded"}]}
+        )
+        assert [d.observation_id for d in response.deletes] == [self.OBS_ID]
+
+    def test_delete_still_accepts_observation_id(self):
+        from hindsight_api.engine.consolidation.consolidator import _ConsolidationBatchResponse
+
+        response = _ConsolidationBatchResponse.model_validate(
+            {"creates": [], "updates": [], "deletes": [{"observation_id": self.OBS_ID}]}
+        )
+        assert [d.observation_id for d in response.deletes] == [self.OBS_ID]
+
+    def test_delete_wire_contract_is_unchanged(self):
+        """Providers keep receiving `observation_id`, and so does `model_dump`."""
+        from hindsight_api.engine.consolidation.consolidator import _DeleteAction
+
+        schema = _DeleteAction.model_json_schema()
+        assert sorted(schema["properties"]) == ["observation_id", "reason"]
+        assert schema["required"] == ["observation_id"]
+        assert _DeleteAction(observation_id=self.OBS_ID).model_dump() == {
+            "observation_id": self.OBS_ID,
+            "reason": "",
+        }
+
+
 class TestDedupeUpdates:
     """`_dedupe_updates` collapses LLM responses that target one observation_id
     multiple times — without this, the second `_execute_update_action` call

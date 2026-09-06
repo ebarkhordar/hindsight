@@ -30,7 +30,7 @@ from itertools import combinations
 from typing import TYPE_CHECKING, Any, Literal
 
 import asyncpg
-from pydantic import BaseModel, ValidationError, field_validator
+from pydantic import AliasChoices, BaseModel, Field, ValidationError, field_validator
 
 from ...config import get_config
 from ...worker.stage import set_stage
@@ -827,7 +827,8 @@ class _UpdateAction(BaseModel):
 
 
 class _DeleteAction(BaseModel):
-    observation_id: str  # UUID of the observation to remove
+    # `id` too: that is the key the observation arrives under in the prompt's INPUT section.
+    observation_id: str = Field(validation_alias=AliasChoices("observation_id", "id"))
     reason: str = ""  # LLM's one-sentence justification (diagnostic only)
 
 

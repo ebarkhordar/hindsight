@@ -61,7 +61,7 @@ _FACT_FIELDS = """One per line, formatted as `[uuid] fact text (temporal fields)
 - `occurred_start` / `occurred_end`: when the described event happened. This can be long before the fact was stated — a fact recorded today may describe a 2019 event.
 - `mentioned_at`: when the source material that states this fact was written. This is the fact's recency: how up to date the statement is, NOT when it was added to memory. A fact taken from an old document keeps its old `mentioned_at` even if it was only just processed."""
 
-_OBSERVATION_FIELDS = """- `id`: unique identifier — copy this exactly when issuing an UPDATE or DELETE
+_OBSERVATION_FIELDS = """- `id`: unique identifier, copy it verbatim into `observation_id` when issuing an UPDATE or DELETE
 - `text`: the observation content
 - `proof_count`: how many source facts this observation has already merged
 - `occurred_start` / `occurred_end`: the span of the events behind the observation — earliest start and latest end across its source facts
@@ -152,7 +152,7 @@ Expected output (UPDATE for the state change; CREATE for the unrelated work-hour
 - `observation_id`: copy the EXACT `id` UUID string from existing observations.
 - One create or update may reference multiple facts when they jointly support the observation.
 - **AT MOST ONE UPDATE PER `observation_id`**: if several new facts all update the same existing observation, emit a single `updates` entry that lists all contributing `source_fact_ids` and a single consolidated `text`. Never emit two `updates` entries with the same `observation_id` in one response — they would silently overwrite each other.
-- `deletes`: only when an observation is directly superseded or contradicted by new facts.
+- `deletes`: only when an observation is directly superseded or contradicted by new facts. Key each entry by `observation_id`, exactly as an update does.
 - `reason`: REQUIRED on every create/update/delete — one sentence explaining the choice. For a CREATE, state which existing observation(s) you considered and why none matched (a near-identical existing observation means you should UPDATE, not CREATE). This is audited to catch duplicate creates.
 - Do NOT include `tags` — handled automatically.
 - Return `{{"creates": [], "updates": [], "deletes": []}}` if nothing durable is found."""
